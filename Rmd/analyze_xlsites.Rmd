@@ -1,0 +1,714 @@
+---
+title: "Annotate XLs and comparison of control and FTLD"
+author: "Katharina Hembach"
+date: "11.06.2021"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+  
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, dev = "png",
+                      dev.args = list(png = list(type = "cairo")),
+                      warning = FALSE, message = FALSE)
+```
+
+
+### Load packages
+```{r, message = FALSE}
+library(here)
+library(stringr)
+library(rtracklayer)
+library(readxl)
+library(dplyr)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(ggplot2)
+library(data.table)
+library(eulerr)
+library(RColorBrewer)
+library(GenomicFeatures)
+library(ggrepel)
+library(ggpubr)
+```
+
+# Load data
+
+```{r load-data}
+gtf_file <- here("reference", "Homo_sapiens.GRCh38.98_snoDB.sorted.gtf")
+gtf <- import(gtf_file)
+genome <- BSgenome.Hsapiens.UCSC.hg38
+genes <- gtf[gtf$type =="gene"]
+
+metadat <- read_excel(here("metadata.xlsx"))
+metadat
+
+xl_files <- list.files(path = here("output", "xlsites"), 
+                       pattern = "ERR.*_cDNA_unique.bed", full.names = TRUE)
+nam <- str_split(xl_files, pattern = "/", simplify = TRUE)
+names(xl_files) <- str_split(nam[, ncol(nam)], pattern = "_", simplify = TRUE)[,1]
+xl <- lapply(xl_files, import)
+xl <- lapply(xl, function(x) {x$cDNA <- x$score; x$score <- NULL; x})
+## number of XL sites per sample
+lapply(xl, length)
+# number of XL sites with specific number of cDNAs
+lapply(xl, function(x) table(x$cDNA))
+```
+
+We also load the table with the target genes in Manu's CLIP-seq experiment.
+```{r load-CLIP-targets}
+clip_tab <- read.table(file.path("/home", "kathi", "Manu_TDP_CLIP", "analysis",
+                                 "filtered_mp", 
+                                 "gene_peak_count_merge_peaks_filtered.txt"), 
+                       header = TRUE)
+```
+  
+# Target genes
+
+We annotate each XL site with the overlapping gene(s).
+
+```{r annotate-XL, warning = FALSE}
+## each xl get's a number as ID
+xl <- lapply(xl, function(x){
+  x$ID <- 1:length(x)
+  x
+})
+
+xl_an <- lapply(names(xl), function(x) {
+  olap <- findOverlaps(xl[[x]], genes, ignore.strand = FALSE)  
+  data.frame(xl_id = xl[[x]][queryHits(olap)]$ID, 
+             gene_id = genes[subjectHits(olap)]$gene_id)
+})
+names(xl_an) <- names(xl)
+lapply(xl_an, nrow)
+## number of target genes
+lapply(xl_an, function(x) x$gene_id %>% unique %>% length)
+```
+
+We merge the replicates (excluding sample ERR039847 from higher band) and sum the number of cDNAs per XL.
+```{r merge-replicates}
+metadat_filt <- metadat %>% dplyr::filter(names != "ERR039847")
+
+xl_merge <- list()
+for(i in unique(metadat_filt$group)){
+  ind <- metadat_filt$names[which(metadat_filt$group == i)]
+  tmp <- xl[[ind[1]]]
+  for (j in ind[-1]){
+    olap <- findOverlaps(tmp, xl[[j]])
+    tmp$cDNA[queryHits(olap)] <- tmp$cDNA[queryHits(olap)] + xl[[j]]$cDNA[subjectHits(olap)]
+    tmp <- c(tmp, xl[[j]][-subjectHits(olap)])
+  }
+  xl_merge[[i]] <- tmp
+}
+lapply(xl_merge, length)
+lapply(xl_merge, function(x) table(x$cDNA))
+
+lapply(names(xl_merge), function(x) export(xl_merge[[x]], 
+                                           here("analysis", "merged_repl", 
+                                                paste0("xls_merged_", x, ".bed"))))
+
+## each xl get's a number as ID
+xl_merge <- lapply(xl_merge, function(x){
+  x$ID <- 1:length(x)
+  x
+})
+
+saveRDS(xl_merge, here("Rmd", "rds", "xl_merge.rds"))
+
+xl_merge_an <- lapply(names(xl_merge), function(x) {
+  olap <- findOverlaps(xl_merge[[x]], genes, ignore.strand = FALSE)  
+  data.frame(xl_id = xl_merge[[x]][queryHits(olap)]$ID, 
+             gene_id = genes[subjectHits(olap)]$gene_id)
+})
+names(xl_merge_an) <- names(xl_merge)
+lapply(xl_merge_an, nrow)
+## number of target genes
+lapply(xl_merge_an, function(x) x$gene_id %>% unique %>% length)
+```
+
+
+## Filter target genes based on xl location
+
+We filter out protein coding genes and spliced lncRNAs where all xls overlaps with small RNAs, because we saw in IGV that all these examples show now evidence of actual binding to the long genes.
+
+For all protein coding genes, if RBDm xls are exclusively present in regions overlapping to small RNA gene, it gets reassigned to that gene and the annotation to the protein-coding gene is removed.
+```{r identify-wrong-pc-target-genes}
+## we tested different overlap values and decided to use 70%
+to_filter <- lapply(names(xl_merge_an), function(s) {
+  x <- xl_merge_an[[s]]
+  g <- genes[genes$gene_id %in% x$gene_id]
+  ##seperate protein coding and long lncRNAs from short genes
+  pc <- g[g$gene_biotype == "protein_coding"]$gene_id
+  ## separate spliced from unspliced lncRNAs
+  lnc <- g[g$gene_biotype == "lncRNA"]$gene_id
+  g1 <- gtf[gtf$gene_id %in% lnc]
+  e <- g1[g1$type == "exon"]
+  sp <- split(e$exon_number, e$gene_id)
+  ## all lncRNAs with more than 1 exon
+  lnc_spl <- names(sp)[lengths(lapply(sp, unique)) > 1]
+  ## all spliced genes, that need to be checked for potential false positives
+  pc <- c(pc, g[g$gene_id %in% lnc_spl]$gene_id)
+  ## list of small RNAs that might cause the xls in the long genes
+  ## ## except TEC, MT_rRNA, 
+  # short <- g[g$gene_biotype %in% c("lncRNA", "miRNA", "misc_RNA", "rRNA", 
+  #                                  "ribozyme", "scaRNA", "snRNA",  "snoRNA")]
+  ## everything except the protein coding genes and pseudogenes
+  short <- g[!g$gene_biotype %in% c("protein_coding", "processed_pseudogene", 
+      "rRNA_pseudogene", "transcribed_processed_pseudogene", 
+      "transcribed_unitary_pseudogene", "transcribed_unprocessed_pseudogene", 
+      "unprocessed_pseudogene", "TEC", "translated_unprocessed_pseudogene", 
+      "polymorphic_pseudogene", "pseudogene", "TR_V_pseudogene", 
+      "translated_unprocessed_pseudogene", "unitary_pseudogene")]
+  ## remove the long lncRNAs
+  short <- short[!short$gene_id %in% pc]
+  ## go through  the list of genes and determine if all xls overlap small RNAs
+  res <- lapply(pc, function(i) {
+    xls <- x[x$gene_id ==i, "xl_id"]
+    nr_olap <- countOverlaps(xl_merge[[s]][xl_merge[[s]]$ID %in% xls], short,
+                             ignore.strand = FALSE)
+    if(all(nr_olap > 0)){ ## all xls overlap at least one short RNA
+      return(i)
+    } 
+    return(NULL)
+  })
+  unique(unlist(res)) ## all genes that are no true targets
+})
+names(to_filter) <- names(xl_merge_an)
+lengths(to_filter)
+```
+
+```{r filter-target-genes}
+# what are the filtered genes?
+lapply(to_filter, function(x){
+  g <- genes[genes$gene_id %in% x]
+  m <- match(x, g$gene_id)
+  data.frame(gene_id = x, gene_name = g[m]$gene_name, 
+             gene_biotype = g[m]$gene_biotype )
+  })
+lapply(to_filter, function(x) genes[genes$gene_id %in% x]$gene_name)
+
+## remove the wrong targets from the list
+nam <- names(xl_merge_an)
+xl_merge_an <- lapply(names(xl_merge_an), function(x) {
+  xl_merge_an[[x]] %>% dplyr::filter(!gene_id %in% to_filter[[x]])
+})
+names(xl_merge_an) <- nam
+
+## number of target genes after filtering
+lapply(xl_merge_an, function(x) {
+  length(unique(x$gene_id))})
+
+saveRDS(xl_merge_an, here("Rmd", "rds", "xl_merge_an.rds"))
+```
+
+# Target genes
+
+We need a table with all target genes and the number of XLs per gene.
+
+```{r gdf}
+## data.frame with all target genes
+gdf <- as.data.frame(genes[genes$gene_id %in% 
+    (lapply(xl_an, function(x) x$gene_id %>% unique) %>% unlist %>% unique)]) %>% 
+  dplyr::select(seqnames, start, end, strand, gene_id, gene_name, gene_biotype)
+  
+## add the number of xls per group
+for(i in names(xl_merge)){
+  xlcount <- xl_merge_an[[i]] %>% dplyr::group_by(gene_id) %>% dplyr::summarise(n = n())
+  m <- match(gdf$gene_id, xlcount$gene_id)
+  cname <- paste0("nxls_", i)
+  gdf[,cname] <- xlcount$n[m]
+  gdf[is.na(gdf[,cname]), cname] <- 0
+  ## mean number of cDNAs
+  cname <- paste0("mean_max_cDNAs_", i)
+  sp <- split(xl_merge_an[[i]]$xl_id, xl_merge_an[[i]]$gene_id)
+  p <- lapply(sp, function(x) {
+    mean(xl_merge[[i]][xl_merge[[i]]$ID %in% x]$cDNA)})
+  m <- match(names(p), gdf$gene_id)
+  gdf[,cname] <- 0
+  gdf[,cname][m] <- unlist(p)
+}
+
+## sort according to number of XLs
+gdf <- gdf %>% dplyr::arrange(desc(nxls_control))
+gdf %>% head
+gdf %>% dplyr::arrange(desc(nxls_FTLD)) %>% head
+
+## distribution of gene types
+gdf$gene_biotype %>% table
+## we remove pseudogenes
+gdf <- gdf %>% dplyr::filter(!gene_biotype %in% 
+    c("processed_pseudogene", "rRNA_pseudogene", 
+      "transcribed_processed_pseudogene", "transcribed_unitary_pseudogene", 
+      "transcribed_unprocessed_pseudogene", "unprocessed_pseudogene", "TEC", 
+      "translated_unprocessed_pseudogene", "polymorphic_pseudogene", 
+      "pseudogene", "TR_V_pseudogene", "translated_unprocessed_pseudogene", 
+      "unitary_pseudogene"))
+gdf$gene_biotype %>% table
+nrow(gdf)
+
+## genes with FTLD XLs but 0 control XLs
+gdf %>% dplyr::arrange(desc(nxls_FTLD)) %>% 
+  dplyr::filter(nxls_control == 0) %>% 
+  head
+
+write.table(gdf, here("analysis", "gene_XL_count_merged_replicates.txt"),
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+
+
+# Venn diagram
+
+Venn and euler diagram of the genes with at least one XL
+
+```{r venn-diagram}
+gene_list <- list("control" = gdf$gene_id[gdf$nxls_control>0], 
+                  "FTLD" = gdf$gene_id[gdf$nxls_FTLD>0])
+euler_diag <- euler(gene_list, shape = "circle")
+venn_diag <- venn(gene_list)
+
+eulerr_options(labels = list(fontsize = 20), 
+               quantities = list(fontsize = 20, font = 2), 
+               fills = list(alpha = 0.5),
+               padding = unit(0.6, "lines"))
+p <- plot(euler_diag, font=1, 
+     fills=c("#117733", "#882255"),
+     edges=c("#117733", "#882255"),
+     labels = list(col = c("#117733", "#882255")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+svg(here("analysis", "figures", "euler.svg")); p; dev.off()
+
+p <- plot(venn_diag,font=1, 
+     fills=c("#117733", "#882255"),
+     edges=c("#117733", "#882255"),
+     labels = list(col = c("#117733", "#882255")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+svg(here("analysis", "figures", "venn.svg")); p; dev.off()
+```
+
+What are the targets only found in control or FTLD samples?
+```{r unique-targets-list}
+gdf_c <- gdf[gdf$nxls_control>0 & gdf$nxls_FTLD==0,]
+table(gdf_c$gene_biotype)
+gdf_ftld <- gdf[gdf$nxls_control==0 & gdf$nxls_FTLD>0,]
+table(gdf_ftld$gene_biotype)
+
+write.table(gdf_c, here("analysis", "gene_XL_count_merged_replicates_control_unique.txt"),
+            quote = FALSE, sep = "\t", row.names = FALSE)
+write.table(gdf_ftld, here("analysis", "gene_XL_count_merged_replicates_FTLD_unique.txt"),
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+
+# Distribution of gene biotype
+
+What is the distribution of biotypes in the control and FTLD samples?
+
+```{r biotype-distr}
+## all target genes of WT, 6M and RBDm
+gene_sets <- list(control = gdf %>% dplyr::filter(nxls_control > 0), 
+                  FTLD = gdf %>% dplyr::filter(nxls_FTLD > 0))
+lapply(gene_sets, nrow)
+lapply(gene_sets, function(x) x$gene_biotype %>% table)
+
+gene_sets <- lapply(gene_sets, function(x) {
+   x$gene_biotype_category <- ifelse(x$gene_biotype %in% 
+                                      c("IG_V_gene", "IG_C_gene", "scaRNA", 
+                                        "misc_RNA", "miRNA", "Mt_rRNA", 
+                                        "Mt_tRNA", "ribozyme", "rRNA", 
+                                        "TR_C_gene", "TR_V_gene", "vaultRNA", 
+                                        "scRNA"), 
+                                     "other", x$gene_biotype)
+   x})
+lapply(gene_sets, function(x) x$gene_biotype_category %>% table)
+
+# percentage
+lapply(gene_sets, function(x){
+  a <- x$gene_biotype_category
+  n <- length(a)
+  round(table(a)/n*100, digits = 2)}
+  )
+
+df <- data.frame(sample = c(rep("control", nrow(gene_sets[["control"]])),
+                            rep("FTLD", nrow(gene_sets[["FTLD"]]))),
+                 biotype = c(gene_sets[["control"]]$gene_biotype,
+                             gene_sets[["FTLD"]]$gene_biotype)) %>%
+  dplyr::mutate(sample = factor(sample, levels = c("control", "FTLD"))) %>%
+  dplyr::group_by(sample, biotype) %>% dplyr::summarize(nr_genes = n())
+cols <- c("#DB7093","#E8601C","#7BAFDE","#1965B0","#B17BA6",
+               "#882E72","#F1932D","#F6C141","#F7EE55","#4EB265",
+               "#90C987","#CAEDAB","#777777")
+cols <- cols[c(1, 3, 6, 7, 10, 9, 2, 5, 4, 13)]
+p <- ggplot(df, aes(x = sample, y = nr_genes, fill = biotype)) + 
+    geom_bar(position = "fill", stat = "identity") + 
+    theme_bw() +
+    facet_wrap(~sample, nrow = 1, scales = "free_x") +
+    theme(text = element_text(size = 14), legend.position = "right", 
+          # legend.direction="horizontal", legend.box = "horizontal", 
+          plot.title = element_text(hjust = 0.5)) +
+    ylab("fraction of genes") 
+    # + scale_fill_manual(values = cols)
+p
+
+df <- data.frame(sample = c(rep("control", nrow(gene_sets[["control"]])),
+                            rep("FTLD", nrow(gene_sets[["FTLD"]]))),
+                 biotype = c(gene_sets[["control"]]$gene_biotype_category,
+                             gene_sets[["FTLD"]]$gene_biotype_category)) %>%
+   dplyr::mutate(biotype = factor(biotype, 
+                                  levels = c("lncRNA", "protein_coding", 
+                                             "snoRNA",  "snRNA", "other"))) %>%
+  dplyr::mutate(sample = factor(sample, levels = c("control", "FTLD"))) %>%
+  dplyr::group_by(sample, biotype) %>% dplyr::summarize(nr_genes = n())
+cols <- c(brewer.pal(n = 8, name = "Set2")[1:4],  "darkgrey")
+p <- ggplot(df, aes(x = sample, y = nr_genes, fill = biotype)) + 
+    geom_bar(position = "fill", stat = "identity") + 
+    theme_bw() +
+    facet_wrap(~sample, nrow = 1, scales = "free_x") +
+    theme(text = element_text(size = 14), legend.position = "right", 
+          # legend.direction="horizontal", legend.box = "horizontal", 
+          plot.title = element_text(hjust = 0.5)) +
+    ylab("fraction of genes") +
+    scale_fill_manual(values = cols)
+p
+```
+
+## Comparison of the number of XLs per gene
+
+```{r XL-per-gene}
+## plot #Xl and mean max cDNAs per gene and per biotype for both groups
+p <- gene_sets[["control"]] %>%
+  ggplot(aes(x = gene_biotype_category, y = nxls_control)) + 
+  geom_violin() + 
+  geom_boxplot(width=0.1) + 
+  theme_bw() + 
+  ggtitle("control") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_log10()
+p
+
+p <- gene_sets[["FTLD"]] %>%
+  ggplot(aes(x = gene_biotype_category, y = nxls_FTLD)) + 
+  geom_violin() + 
+  geom_boxplot(width=0.1) + 
+  theme_bw() + 
+  ggtitle("FTLD") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_log10()
+p
+
+p <- gene_sets[["control"]] %>%
+  ggplot(aes(x = gene_biotype_category, y = mean_max_cDNAs_control)) + 
+  geom_violin() + 
+  geom_boxplot(width=0.1) + 
+  theme_bw() + 
+  ggtitle("control") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_log10()
+p
+
+p <- gene_sets[["FTLD"]] %>%
+  ggplot(aes(x = gene_biotype_category, y = mean_max_cDNAs_FTLD)) + 
+  geom_violin() + 
+  geom_boxplot(width=0.1) + 
+  theme_bw() + 
+  ggtitle("FTLD") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_log10()
+p
+```
+
+We normalize the number of XL by the total number of XL in each group.
+
+```{r XL-per-gene-normalized}
+## plot #Xl and mean max cDNAs per gene and per biotype for both groups
+p <- gene_sets[["control"]] %>%
+  ggplot(aes(x = gene_biotype_category, y = nxls_control/sum(nxls_control))) + 
+  geom_violin() + 
+  geom_boxplot(width=0.1) + 
+  theme_bw() + 
+  ggtitle("control") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_log10()
+p
+
+p <- gene_sets[["FTLD"]] %>%
+  ggplot(aes(x = gene_biotype_category, y = nxls_FTLD/sum(nxls_FTLD))) + 
+  geom_violin() + 
+  geom_boxplot(width=0.1) + 
+  theme_bw() + 
+  ggtitle("FTLD") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_log10()
+p
+```
+
+
+# Hexamer enrichment in window surrounding XL sites
+
+We want to replicate figure 2a of the Tollervey et al. 2011 paper. We compute the pentamer enrichment in windows of size 61 centered on the XL position.
+
+We only consider the gene annotation of the target genes per sample to avoid issues with overlapping genes. For all target genes, the sets of exonic, 3'UTR, 5'UTR and intronic regions are compiled.
+
+```{r prepare-annotation}
+# genes <- mp_an[["RBDm"]]$gene_id
+prep_an <- function(gtf, genes){
+  g <- gtf[gtf$gene_id %in% genes]
+  
+  exon <- g[g$type == "exon"] %>% unique
+  five_utr <- g[g$type == "five_prime_utr"] %>% unique
+  three_utr <- g[g$type == "three_prime_utr"] %>% unique
+
+  ## We remove all 3' and 5' UTR regions that overlap with any exons
+  exon_utr <- GenomicRanges::setdiff(exon, three_utr)
+  exon_unique <- GenomicRanges::setdiff(exon_utr, five_utr) %>% unique
+  # We remove 3'UTR regions that overlap with 5'UTR regions
+  three_utr_unique <- GenomicRanges::setdiff(three_utr, five_utr) %>% unique
+  anno <- GRangesList(exon = exon_unique, three_prime_utr = three_utr_unique, 
+             five_prime_utr = five_utr)
+  ## intron annotation
+  txdb <- makeTxDbFromGRanges(g)
+  introns <- unlist(intronsByTranscript(txdb))
+  ## remove the intronic parts that overlap with exons from other transcripts
+  anno[["intron"]] <- GenomicRanges::setdiff(introns, c(anno[["exon"]], 
+                                         anno[["three_prime_utr"]], 
+                                         anno[["five_prime_utr"]])) %>% reduce
+  ## reduce potentially overlapping ranges
+  lapply(anno, reduce)
+}
+
+sample_an <- lapply(names(xl_merge_an), function(n) 
+  prep_an(gtf, xl_merge_an[[n]]$gene_id %>% unique))
+names(sample_an) <- names(xl_merge_an)
+sample_an <- lapply(sample_an, function(x) 
+  lapply(x, function(i) {
+  seqlevelsStyle(i) <- "UCSC"
+  i}))
+
+lapply(sample_an, function(x) lapply(x, length))
+saveRDS(sample_an, here("Rmd", "rds", "sample_an_xl_merge.rds"))
+```
+
+
+```{r z-score-function-def}
+## for each sample
+## we place the window at a random position within each bg seq
+## we compute the oligomer counts
+## we repeat this 100 times, to generate a matrix with oligomer x 100 (oligomer count for each repetition)
+shuffled_oligomer_counts <- function(b, w_size, nolig = 6){
+  ## only keep the region that are at least as big as w_size
+  b <- b[lengths(b) >= w_size]
+  names(b) <- 1:length(b)
+  # random number between 0 and 1 is multiplied with sequence length to determine the start position of the shuffled window
+  starts <- floor(1 + runif(length(b)) * (lengths(b)-w_size + 1))
+  # subset the sequences according to random start coordinates
+  seq <- subseq(b, start = starts, end = starts + w_size - 1)
+  of <- oligonucleotideFrequency(seq, width = nolig, step = 1, 
+                                  simplify.as = "collapsed")
+}
+
+## given window size, peaks with position of peak center and overlapping annotation regions,
+## we can compute the oligomer occurrence in the peak windows
+## and we shuffle the windows in the annotation regions 100 timnes and 
+## also count the oligomers to compute the x-score per oligomer 
+oligomer_zscore <- function(wind_size = 41, xl, sample_an, nolig = 6){
+  half_wind <- (wind_size-1)/2
+
+  ## Peak window regions
+  wind <- lapply(xl, function(x) 
+    GRanges(seqnames(x), IRanges(start(x)-half_wind, end(x)+half_wind), 
+            strand = strand(x), ID = x$ID))
+  
+  ## Annotation regions overlapping with at least half of a window
+  sample_an_wind <- lapply(names(sample_an), function(x) 
+    lapply(sample_an[[x]], function(a) {
+      a[queryHits(findOverlaps(a, wind[[x]], minoverlap = half_wind+1))]
+    })
+  )
+  names(sample_an_wind) <- names(sample_an)
+  
+  ## genomice sequence of windows and annotation regions
+  wind_seq <- lapply(wind, function(x) getSeq(genome, x))
+  bg_seq <- lapply(sample_an_wind, function(x) 
+    GRangesList(x) %>% 
+      unlist %>% 
+      getSeq(x = genome, names = .))
+  
+  ## oligomer count in window
+  obs <- lapply(wind_seq, function(x) {
+    oligonucleotideFrequency(x, width = nolig, step = 1, 
+                                    simplify.as = "collapsed")
+  })
+  
+  ## oligomer count in shuffled windows
+  obs_sh <- lapply(names(bg_seq), function(x) {
+    obs_sh <- list()
+    for(i in 1:100){
+      obs_sh[[i]] <- shuffled_oligomer_counts(b = bg_seq[[x]], w_size = wind_size, nolig)
+    }
+    obs_sh <- bind_cols(obs_sh)
+    obs_sh
+  })
+  names(obs_sh) <- names(bg_seq)
+  
+  ## z-score
+  sh_params <- lapply(obs_sh, function(x) {
+      data.frame(mean = rowMeans(x), sd = apply(x, 1, sd))
+  })
+  
+  z_scores <- lapply(names(obs), function(x) {
+    (obs[[x]] - sh_params[[x]]$mean) / sh_params[[x]]$sd
+  })
+  names(z_scores) <- names(obs)
+  saveRDS(z_scores, here("Rmd", "rds", paste0("z_scores_wind", wind_size, ".rds")))
+  z_scores
+}
+
+## Plot the z-scores of two peak sets against each other 
+plot_oligomer <- function(dfz, xparam, yparam, i, label = "oligomer"){
+  lim <- c(min(dfz[, xparam[i]], dfz[, yparam[i]]), max(dfz[, xparam[i]], dfz[, yparam[i]]))
+  p <- ggplot(dfz, aes_string(x = xparam[i], y = yparam[i], label = label)) + 
+    geom_point(alpha = 0.3, col = "darkblue") +
+    theme_bw() + xlim(lim) + ylim(lim) + theme(aspect.ratio = 1) +
+    stat_cor(method = "pearson", label.x.npc = "center", label.y.npc = "top") +
+    geom_smooth(method="lm", se = TRUE, color = "darkgrey") +
+    geom_text_repel(data = rbind(dfz %>% 
+                      dplyr::arrange(desc(get(xparam[i]))) %>% 
+                      dplyr::slice(1:20),
+                      dfz %>% 
+                      dplyr::arrange(desc(get(yparam[i]))) %>% 
+                      dplyr::slice(1:20)) %>% 
+                      unique) 
+  print(p)
+}
+```
+
+
+# Z-score for different oligomer and window sizes
+
+We use a centered window on the max peak height instead of the full peak sequence. We try different window sizes to check how close the potential motif is to the peak center.
+
+## pentamer & window 61
+
+What are the hexamers with the highest z-score per sample?
+
+```{r wind-61, warning = FALSE, message = FALSE}
+xl_merge_ucsc <- lapply(xl_merge, function(x) {seqlevelsStyle(x) <- "UCSC"; x})
+## filter the seqnames 
+xl_merge_ucsc <- lapply(xl_merge_ucsc, function(x) 
+  x[seqnames(x) %in% seqnames(genome)])
+z_scores <- oligomer_zscore(wind_size = 31, xl_merge_ucsc, sample_an, nolig = 5)
+lapply(z_scores, summary)
+lapply(z_scores, function(x) x[order(x)][1:20])
+lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores, function(x) x["GTGTG"])
+lapply(z_scores, function(x) x["TGTGT"])
+```
+Are the top pentamers similar between samples?
+
+### Scatterplot {.tabset}
+
+```{r z-score-plots-61, results = "asis", message = FALSE}
+dfz <- data.frame(pentamer = names(z_scores[[1]]), 
+                  zscore_control = z_scores[["control"]],
+                  zscore_FTLD = z_scores[["FTLD"]])
+xparam <- c("zscore_control")
+yparam <- c("zscore_FTLD")
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_oligomer(dfz, xparam, yparam, i, label = "pentamer")
+  cat("\n\n")
+}
+```
+
+## hexamer & window 61
+
+What are the hexamers with the highest z-score per sample?
+
+```{r hexamer-wind-61, warning = FALSE, message = FALSE}
+xl_merge_ucsc <- lapply(xl_merge, function(x) {seqlevelsStyle(x) <- "UCSC"; x})
+## filter the seqnames 
+xl_merge_ucsc <- lapply(xl_merge_ucsc, function(x) 
+  x[seqnames(x) %in% seqnames(genome)])
+z_scores <- oligomer_zscore(wind_size = 31, xl_merge_ucsc, sample_an, nolig = 6)
+lapply(z_scores, summary)
+lapply(z_scores, function(x) x[order(x)][1:20])
+lapply(z_scores, function(x) x[order(x, decreasing = TRUE)][1:30])
+lapply(z_scores, function(x) x["GTGTGT"])
+lapply(z_scores, function(x) x["TGTGTG"])
+```
+Are the top pentamers similar between samples?
+
+### Scatterplot {.tabset}
+
+```{r hexamer-z-score-plots-61, results = "asis", message = FALSE}
+dfz <- data.frame(hexamer = names(z_scores[[1]]), 
+                  zscore_control = z_scores[["control"]],
+                  zscore_FTLD = z_scores[["FTLD"]])
+xparam <- c("zscore_control")
+yparam <- c("zscore_FTLD")
+
+for(i in 1:length(xparam)){
+  cat("#### ", xparam[i], " vs. ",  yparam[i], "\n")
+  plot_oligomer(dfz, xparam, yparam, i, label = "hexamer")
+  cat("\n\n")
+}
+```
+
+
+# Comparison of target genes with our TDP-43 CLIP-seq targets
+
+```{r comparison-CLIP-targets}
+# All target genes
+gene_comparison_list <- list("Manu" = clip_tab$gene_id, 
+                             "Tollervey" = gdf$gene_id)
+euler_diag <- euler(gene_comparison_list, shape = "circle")
+venn_diag <- venn(gene_comparison_list)
+
+eulerr_options(labels = list(fontsize = 20), 
+               quantities = list(fontsize = 20, font = 2), 
+               fills = list(alpha = 0.5),
+               padding = unit(0.6, "lines"))
+p <- plot(euler_diag, font=1, 
+     fills=c("#117733", "#882255"),
+     edges=c("#117733", "#882255"),
+     labels = list(col = c("#117733", "#882255")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+
+# only our WT and Tollervey control
+gene_comparison_list <- list("Manu WT" = clip_tab$gene_id[clip_tab$npeaks_WT>0], 
+                             "Tollervey control" = gdf$gene_id[gdf$nxls_control>0])
+euler_diag <- euler(gene_comparison_list, shape = "circle")
+venn_diag <- venn(gene_comparison_list)
+
+p <- plot(euler_diag, font=1, 
+     fills=c("#117733", "#882255"),
+     edges=c("#117733", "#882255"),
+     labels = list(col = c("#117733", "#882255")),
+     quantities = TRUE,
+     alpha=0.6, lwd = 4, adjust_labels = FALSE)
+p
+```
+
+## Comparison per biotype {.tabset}
+We compare the target genes for each biotype separately.
+```{r comparison-targets-biotype, results = "asis"}
+for(b in unique(gdf$gene_biotype)){
+  cat("### ", b, " \n\n")
+  gl <- list("Manu" = clip_tab$gene_id[clip_tab$gene_biotype == b],
+             "Tollervey" = gdf$gene_id[gdf$gene_biotype == b])
+  euler_diag <- euler(gl, shape = "circle")
+  p <- plot(euler_diag, font=1,
+       quantities = TRUE,
+       alpha=0.6, lwd = 4, adjust_labels = FALSE)
+  print(p)
+  cat("\n\n")
+}
+```
+
