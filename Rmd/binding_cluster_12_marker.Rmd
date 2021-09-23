@@ -1,0 +1,73 @@
+---
+title: "XL sites in cluster 12 markers (neuronal scRNA-seq)"
+author: "Katharina Hembach"
+date: "13.07.2021"
+output: 
+  html_document:
+    toc: true,
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, autodep = TRUE, cache = TRUE, dev = "png",
+                      dev.args = list(png = list(type = "cairo")), 
+                      message = FALSE, cache.lazy = FALSE)
+```
+
+### Load packages
+```{r, message = FALSE}
+library(here)
+library(rtracklayer)
+library(dplyr)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(GenomicFeatures)
+```
+
+# Load data
+
+```{r load-data}
+gtf_file <- here("reference", "Homo_sapiens.GRCh38.98_snoDB.sorted.gtf")
+gtf <- import(gtf_file)
+genes <- gtf[gtf$type =="gene"]
+
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+xl_files <- list(control = import(here("analysis", "merged_repl", 
+                                       "xls_merged_control.bed ")),
+                 FTLD = import(here("analysis", "merged_repl", 
+                                    "xls_merged_FTLD.bed")))
+```
+
+# UG repeats in NPTX2
+
+```{r UG-repeats-NPTX2}
+target <- genes[genes$gene_name == "NPTX2"]
+seqlevelsStyle(target) <- "UCSC"
+
+seq <- getSeq(genome, target)[[1]]
+reps <- matchPattern("TGTG", seq)
+reps <- GRanges(seqnames(target), 
+                range = IRanges(start(reps) + start(target) -1, 
+                                end(reps) + start(target) -1),
+                strand = strand(target))
+reps <- reduce(reps)
+export(reps, here("analysis", "cluster_12_markers", "UGUG_NPTX2.bed"))
+
+reps <- matchPattern("TG", seq)
+reps <- GRanges(seqnames(target), 
+                range = IRanges(start(reps) + start(target) -1, 
+                                end(reps) + start(target) -1),
+                strand = strand(target))
+reps <- reduce(reps)
+
+export(reps, here("analysis", "cluster_12_markers", "UG_NPTX2.bed"))
+```
+
+We also need the full 3'UTR region so we can highlight the UGs in the figure.
+
+```{r}
+utr <- gtf[gtf$gene_name == "NPTX2" & gtf$type == "three_prime_utr"]
+seqlevelsStyle(utr) <- "UCSC"
+export(getSeq(genome, utr), here("analysis", "cluster_12_markers", "NPTX2_3UTR.fasta"))
+```
+
